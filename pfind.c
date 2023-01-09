@@ -4,11 +4,11 @@
 #include <stdbool.h>
 #include <string.h>
 #include <threads.h>
-#include <time.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <errno.h>
 
 /* NOTE : some of the implementations (variable names, imports, functions) are based on recitations 8 and 9 code files */
 
@@ -28,7 +28,7 @@ typedef struct Queue {
 } Queue;
 
 typedef struct ThreadData {
-    int id;
+    int* id;
     cnd_t cnd;
 } ThreadData;
 
@@ -42,6 +42,7 @@ atomic_int thread_counter = 0;
 atomic_int thread_index = 0;
 atomic_int MATCHES = 0;
 atomic_int thread_encountered_error = 0;
+atomic_int EXIT_THREADS = 0;
 
 mtx_t lock;
 
@@ -50,29 +51,30 @@ cnd_t finish_init_threads;
 cnd_t* CND_TO_THREAD;
 
 /* Prototypes */
-void init_queue(Queue* q);
+Queue* init_queue();
 Qnode* init_new_dir_qnode(char* value);
 Qnode* init_new_thread_qnode(ThreadData* value, int index);
+ThreadData* init_thread_data(int* id);
 int queue_is_empty(Queue* q);
 void enqueue(Queue* q, Qnode* node);
-int dequeue(Queue* q, int i);
+int dequeue(Queue* q, int i, int flag);
 void* get_value(Queue* q, int i);
 void initialize_all();
 void destroy_all();
-void free_queue(Queue* q);
+void free_queue(Queue* q, int flag);
 void lock_mutex();
 void unlock_mutex();
 void launch_threads(thrd_t* thread);
 int search_directories(void *t);
-int search_dirent_iterativly(char* path);
+int search_dirent_iterativly(char* path, int index);
+void wakeup_all_threads();
 
 
 int main(int argc, char const *argv[]) {
     char* path;
     DIR* root_dir;
     Qnode* root_dir_node;
-    int rc;
-    int t;
+    int i;
 
     if (argc != 4) { perror("ERROR - invalid number of arguments"); exit(1); }
     
@@ -93,30 +95,28 @@ int main(int argc, char const *argv[]) {
     NUM_THREADS = atoi(argv[3]);
 
     /* init DIRECTORY_Q and THREAD_Q*/
-    init_queue(DIRECTORY_Q);
-    init_queue(THREAD_Q);
+    DIRECTORY_Q = init_queue();
+    THREAD_Q = init_queue();
     /* init threads array */
     thrd_t thread[NUM_THREADS];
     /* init all mutex and conditions */
     initialize_all();
-    
+
     /* open root directory */
     root_dir = opendir(path);
     /* add root directory to Directories queue */
     root_dir_node = init_new_dir_qnode(path);
+    
     if (thread_encountered_error == 1) { exit(1); }
     enqueue(DIRECTORY_Q, root_dir_node);
-    
+
     /* Wait for all searching threads to be created */
     launch_threads(thread);
     /* run search threads */
-    for (t = 0; t < NUM_THREADS; t++) {
-        rc = thrd_join(thread[t], NULL);
-        if (rc != thrd_success) {
-            perror("ERROR in thrd_join()\n");
-            exit(1);
-        }
+    for (i = 0; i < NUM_THREADS; i++) {
+        thrd_join(thread[i], NULL);
     }
+
     closedir(root_dir);
     free(path);
 
@@ -137,7 +137,9 @@ int main(int argc, char const *argv[]) {
 * initiate Queue variables
 *
 */
-void init_queue(Queue* q) {
+Queue* init_queue() {
+    Queue* q;
+
     /* allocate memory */
     q = (Queue*) malloc(sizeof(Queue));
     if (q == NULL) {
@@ -149,6 +151,8 @@ void init_queue(Queue* q) {
     q->tail = NULL;
     q->length = 0;
     q->count = 0;
+
+    return q;
 }
 
 /*
@@ -174,7 +178,7 @@ Qnode* init_new_dir_qnode(char* value) {
     new_qnode->next = NULL;
     new_qnode->prev = NULL;
     new_qnode->index = DIRECTORY_Q->count + 1;
-
+    free(value);
     return new_qnode;
 }
 
@@ -209,7 +213,7 @@ Qnode* init_new_thread_qnode(ThreadData* value, int index) {
 * init struct variables of ThreadData by thresd id
 *
 */
-ThreadData* init_thread_data(int id) {
+ThreadData* init_thread_data(int* id) {
     ThreadData* thread_data;
 
     thread_data = (ThreadData*) malloc(sizeof(ThreadData));
@@ -218,7 +222,7 @@ ThreadData* init_thread_data(int id) {
         thread_encountered_error = 1;
     }
     thread_data->id = id;
-    thread_data->cnd = CND_TO_THREAD[id];
+    thread_data->cnd = CND_TO_THREAD[*id];
 
     return thread_data;
 }
@@ -258,7 +262,7 @@ void enqueue(Queue* q, Qnode* node) {
 * else - get the head node of the queue and update the head accordinf to
 * weather there is only one last node remains in the queue
 */
-int dequeue(Queue* q, int i) {
+int dequeue(Queue* q, int i, int flag) {
     Qnode* node;
 
     if (queue_is_empty(q)) {
@@ -278,13 +282,23 @@ int dequeue(Queue* q, int i) {
     if (node->prev != NULL) {
         node->prev->next = node->next;
     }
-    if (node == q->head) { /* if i is index of head */
+    /* update head */
+    if (node == q->head) { 
         q->head = q->head->next;
+    }
+    /* update tail */
+    if (node == q->tail) { 
+        q->tail = q->tail->prev;
     }
     q->length--;
     
-    free(&(node->value));
-    free(node->value);
+    if (flag == 1) {
+        ThreadData* data = (ThreadData*) node->value;
+        free(data);
+    } else {
+        char* path = (char*) node->value;
+        free(path);
+    }
     free(node);
     return 0;
 }
@@ -320,8 +334,9 @@ void initialize_all() {
     
     cnd_init(&wake_all_threads);
     cnd_init(&finish_init_threads);
+
     /* init condition per thread array */
-    CND_TO_THREAD = (cnd_t*) malloc(sizeof(cnd_t)*NUM_THREADS);
+    CND_TO_THREAD = (cnd_t*) malloc(NUM_THREADS*sizeof(cnd_t));
     if (CND_TO_THREAD == NULL) {
         perror("ERROR while allocating memory for CND_TO_THREAD, using malloc");
         exit(1);
@@ -338,28 +353,34 @@ void destroy_all() {
     
     cnd_destroy(&wake_all_threads);
     cnd_destroy(&finish_init_threads);
+
     /* destroy condition per thread array */
     for (i = 0; i < NUM_THREADS; i++) {
         cnd_destroy(&(CND_TO_THREAD[i]));
     }
     free(CND_TO_THREAD);
-    free_queue(THREAD_Q);
-    free_queue(DIRECTORY_Q);
+    free_queue(THREAD_Q, 1);
+    free_queue(DIRECTORY_Q, 0);
 }
 
 /* 
 * free memory allocated to the queue variable
 *
 */
-void free_queue(Queue* q) {
+void free_queue(Queue* q, int flag) {
     Qnode* node;
 
     if (!queue_is_empty(q)) {
         node = q->head;
         while (node != NULL) {
             q->head = node->next;
-            free(&(node->value));
-            free(node->value);
+            if (flag == 1) {
+                ThreadData* data = (ThreadData*) node->value;
+                free(data);
+            } else {
+                char* path = (char*) node->value;
+                free(path);
+            }
             free(node);
             node = q->head;
         }
@@ -378,10 +399,19 @@ void free_queue(Queue* q) {
 void launch_threads(thrd_t* thread) {
     int rc;
     int t;
+    int* id;
 
     mtx_lock(&lock);
     for (t = 0; t < NUM_THREADS; t++) {
-        rc = thrd_create(&thread[t], search_directories, (void *)thread[t]);
+        /* use index as id */
+        id = (int*) malloc(sizeof(int));
+        if (id == NULL) {
+            perror("ERROR while allocating memory for id, using malloc");
+            exit(1);
+        }
+        *id = t;
+
+        rc = thrd_create(&thread[t], search_directories, (void *)id);
         if (rc != thrd_success) {
             perror("ERROR in thrd_create()");
             exit(1);
@@ -394,14 +424,16 @@ void launch_threads(thrd_t* thread) {
 
 /*
 * The function executed by the program threads
-* Searches the directories in the Directories_Q
+* threads without corresponding directory go to sleep 
+* thread matches a directory by counter (index) num
 *
 */
 int search_directories(void *t) {
-    long tid = (long)t;
+    int* tid = (int*)t;
     Qnode* thread_qnode;
     ThreadData* thread_data;
     int curr_index;
+    char* curr_path;
     char* path = (char*) malloc(PATH_MAX);
 
     /* wait for all thread to be created, last thread wakes everyone up */
@@ -410,41 +442,49 @@ int search_directories(void *t) {
     (thread_counter != NUM_THREADS) ? cnd_wait(&wake_all_threads, &lock) :                                 cnd_signal(&finish_init_threads);
     mtx_unlock(&lock);
 
-    while(1) {       
-        mtx_lock(&lock);
-
+    while(1) {    
         /* exit thread when there are no more directories to search */
+        mtx_lock(&lock);
         if (queue_is_empty(DIRECTORY_Q) && THREAD_Q->length >= NUM_THREADS-1) {
             mtx_unlock(&lock);
+            EXIT_THREADS = 1;
+            wakeup_all_threads();
+            free(tid);
             thrd_exit(0);
         }
+        curr_index = ++thread_index; 
+        mtx_unlock(&lock);
 
         /* 
-        2 cases:
-            -> if THREAD_Q is empty and DIRECTORY_Q is empty -> the thread is first in line but there are no directories to work on
-            -> if THREAD_Q isn't empty and there are not enouth directories in DIRECTORY_Q -> current thread has no directory to work on
+        if there are not enouth directories in DIRECTORY_Q -> current thread has no directory to work on
         so thread enqueues to THREAD_Q and goes to sleep
         when a new directory be added to DIRECTORY_Q a signal will wake the thread up
         */
-        curr_index = ++thread_index;
-        if ((queue_is_empty(THREAD_Q) && queue_is_empty(DIRECTORY_Q)) || (!queue_is_empty(THREAD_Q) && DIRECTORY_Q->count < curr_index)) {
+        mtx_lock(&lock);
+        if (DIRECTORY_Q->count < curr_index) {
             thread_data = init_thread_data(tid);
             thread_qnode = init_new_thread_qnode(thread_data, curr_index);
             enqueue(THREAD_Q, thread_qnode);
             cnd_wait(&(thread_data->cnd), &lock);
-            dequeue(THREAD_Q, curr_index);
-        }
-
+            if (EXIT_THREADS) {  /*if all the job is done - wake up to exit*/
+                mtx_unlock(&lock); 
+                free(tid);
+                thrd_exit(0); 
+            }
+            dequeue(THREAD_Q, curr_index, 1);
+        }        
         /* if there is a directory in DIRECTORY_Q assigned to current thread */
-        strcpy(path, ((char*) get_value(DIRECTORY_Q, curr_index)));
-        dequeue(DIRECTORY_Q, curr_index);
-
+        curr_path = (char*) get_value(DIRECTORY_Q, curr_index);
+        strcpy(path, (char*) curr_path);
         mtx_unlock(&lock);
         
-        search_dirent_iterativly(path);
-        free(path);
+        search_dirent_iterativly(curr_path, curr_index);
+        
+        mtx_lock(&lock);
+        dequeue(DIRECTORY_Q, curr_index, 0);
+        mtx_unlock(&lock);
     }
-    return tid;
+    return *tid;
 }
 
 /*
@@ -453,7 +493,7 @@ int search_directories(void *t) {
 * if dirent is directory -> add to DIRECTORY_Q and send a signal to first thread in THREAD_Q 
 * else -> checks term
 */
-int search_dirent_iterativly(char* path) {
+int search_dirent_iterativly(char* path, int index) {
     DIR* dir;
     struct dirent* dirent;
     char* full_path;
@@ -461,11 +501,6 @@ int search_dirent_iterativly(char* path) {
     Qnode* new_dir;
     ThreadData* thread_data;
 
-    if (access(path, R_OK | X_OK) != 0) {
-        printf("Directory %s: Permission denied.\n", path);
-        thread_encountered_error = 1;
-        return -1;
-    } 
     dir = opendir(path);
 
     while ((dirent = readdir(dir)) != NULL) {
@@ -473,30 +508,35 @@ int search_dirent_iterativly(char* path) {
         if ((strcmp(dirent->d_name,".") == 0) || (strcmp(dirent->d_name, "..") == 0)) {
             continue;
         }
-        
         /* get full path */
         full_path = (char*) malloc(PATH_MAX);
         if (full_path == NULL) {
             thread_encountered_error = 1;
-            return -1;
+            perror("ERROR while allocating memory for full_path, using malloc");
+            continue;
         }
         sprintf(full_path, "%s/%s", path, dirent->d_name);
 
         /* get the stats of full_path */
         if (stat(full_path, &stat_data) == -1) {  
-            perror("An error has occurred in stat function");
-            return -1;
+            perror("ERROR in stat() function");
+            thread_encountered_error = 1;
+            continue;
         }
         /* add directory to DIRECTORY_Q and send a signal to wake first in line thread */
         if (S_ISDIR(stat_data.st_mode)) {  /*S_ISDIR is nonzero for directories*/
-            new_dir = init_new_dir_qnode(full_path);
+            if (access(full_path, R_OK | X_OK) == -1) {
+                printf("Directory %s: Permission denied.\n", full_path);
+                continue;
+            } 
+            /* add directory to DIRECTORY_Q */
             mtx_lock(&lock);
+            new_dir = init_new_dir_qnode(full_path);
             enqueue(DIRECTORY_Q, new_dir);
-            if (!queue_is_empty(THREAD_Q)) {
-                thread_data = get_value(THREAD_Q, new_dir->index);
-                if (thread_data != NULL) {
-                    cnd_signal(&(((ThreadData*) thread_data)->cnd));
-                }
+            thread_data = get_value(THREAD_Q, new_dir->index);
+            /*if the corresponding thread asleep (in THREAD - wake it up */
+            if (thread_data != NULL) { 
+                cnd_signal(&(((ThreadData*) thread_data)->cnd));
             }
             mtx_unlock(&lock);
         
@@ -506,9 +546,26 @@ int search_dirent_iterativly(char* path) {
                 printf("%s\n", full_path);
                 MATCHES++;
             }
+            free(full_path);
         }
-        free(full_path);
     }
     closedir(dir);
+
     return 0;
+}
+
+/*
+* wakes up all the thread in THREAD_Q which are sleeping
+* this function is called when all the work is done
+*/
+void wakeup_all_threads() {
+    Qnode* node;
+    ThreadData* thread_data;
+
+    node = THREAD_Q->head;
+    while (node != NULL) {
+        thread_data = (ThreadData*) node->value;
+        cnd_signal(&(thread_data->cnd));
+        node = node->next;
+    }
 }
